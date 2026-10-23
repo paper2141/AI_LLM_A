@@ -1,4 +1,4 @@
-1. 경량화된 Python 3.10 이미지 사용
+#1. 경량화된 Python 3.10 이미지 사용
 
 FROM python:3.10-slim
 
