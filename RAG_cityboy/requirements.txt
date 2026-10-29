@@ -1,45 +1,10 @@
-# 웹 서버 및 스트리밍 지원을 위한 패키지
-
-fastapi==0.109.2
-
-uvicorn==0.27.1
-
-pydantic==2.6.1
-
-python-multipart==0.0.9
-
-
-
-# PDF 처리
-
-PyPDF2==3.0.1
-
-
-
-# LangChain 코어 및 관련 도구
-
-langchain==0.1.7
-
-langchain-core==0.1.23
-
-langchain-community==0.0.20
-
-
-
-# 임베딩 (OpenAI) 및 LLM (Google GenAI)
-
-langchain-openai==0.0.6
-
-langchain-google-genai==0.0.9
-
-
-
-# 벡터 데이터베이스 연동 (Supabase 연동 패키지)
-
-supabase==2.3.5
-
-
-
-# 환경변수 로드
-
-python-dotenv==1.0.1
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+pydantic>=2.7
+pypdf>=4.3
+supabase>=2.7
+langchain-core>=0.3
+langchain-openai>=0.2
+langchain-google-genai>=2.0
+langchain-text-splitters>=0.3
