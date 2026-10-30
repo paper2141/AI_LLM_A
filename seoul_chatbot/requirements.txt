@@ -5,6 +5,7 @@ pydantic>=2.7
 pypdf>=4.3
 chromadb>=0.5
 langchain>=0.3
+langchain-classic>=1.0
 langchain-core>=0.3
 langchain-chroma>=0.1.4
 langchain-google-genai>=2.0
