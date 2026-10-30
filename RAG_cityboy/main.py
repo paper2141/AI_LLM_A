@@ -1,22 +1,32 @@
 """
-도시 정책 RAG 서버 (Google Cloud Run / FastAPI)
+서울시 도시 계획가 RAG 챗봇 서버 (Google Cloud Run / FastAPI)
 
-파이프라인
-  [PDF 업로드] -> /extract : 페이지별 텍스트 추출
-  [벡터 DB 생성] -> /ingest : 청크 분할 -> OpenAI 임베딩 -> Supabase(pgvector) 저장 (진행 상황 SSE)
-  [질의] -> /query : 질의 확장(Query Augmentation) -> Supabase 검색 -> Gemini 답변 스트리밍 (SSE)
+RAG 구성
+  - 문서 로더      : pypdf 로 PDF 읽기
+  - 임베딩 모델    : Google 임베딩 (GoogleGenerativeAIEmbeddings)
+  - 벡터 DB        : Chroma DB
+  - 검색기         : 다중 질문 검색기 (MultiQueryRetriever)
+  - 질의 확장      : RunnablePassthrough 를 이용한 체인 (대화 기록으로 질문을 명확하게 변환)
+  - LLM            : Gemini (기본 gemini-3.5-flash-lite), StreamHandler 로 토큰 스트리밍
 
-필요한 환경 변수 (코드에 키를 직접 쓰지 않습니다)
-  GOOGLE_API_KEY       Google AI(Gemini) API 키
-  OPENAI_API_KEY       OpenAI 임베딩용 API 키
-  SUPABASE_URL         예) https://xxxx.supabase.co
-  SUPABASE_SERVICE_KEY Supabase service_role 키 (서버에서만 사용)
+엔드포인트
+  GET  /health   서버 상태 + RAG 설정 내용
+  POST /extract  PDF -> 페이지별 텍스트
+  POST /ingest   청크 분할 -> 임베딩 -> Chroma 저장 (진행 상황 SSE)
+  POST /query    질의 확장 -> 다중 질문 검색 -> 답변 스트리밍 (SSE)
+
+환경 변수 (코드에 키를 직접 쓰지 않습니다)
+  GOOGLE_API_KEY   Google AI API 키 (LLM + 임베딩 공용)
 선택
-  GEMINI_MODEL         기본 gemini-3.5-flash-lite
-  EMBEDDING_MODEL      기본 text-embedding-3-small (1536차원, supabase.sql 과 일치해야 함)
-  API_SECRET           설정하면 모든 요청에 X-API-Key 헤더가 일치해야 함
-  TOP_K                검색 청크 수 (기본 5)
+  GEMINI_MODEL     기본 gemini-3.5-flash-lite
+  EMBEDDING_MODEL  기본 models/gemini-embedding-001
+  CHROMA_DIR       Chroma 저장 폴더 (기본 /tmp/chroma)
+  API_SECRET       설정하면 모든 요청에 X-API-Key 헤더가 일치해야 함
+  TOP_K            검색 청크 수 (기본 4)
   CHUNK_SIZE / CHUNK_OVERLAP  청크 크기/겹침 (기본 800 / 120)
+
+주의: Cloud Run 의 파일 시스템은 임시 공간이라 인스턴스가 재시작되면 Chroma 데이터가 사라집니다.
+      --max-instances=1 로 배포하고, 재시작 후에는 '벡터 DB 생성'을 다시 실행하세요.
 """
 
 import io
@@ -34,19 +44,21 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from pypdf import PdfReader
 
+from langchain.retrievers.multi_query import MultiQueryRetriever
+from langchain_chroma import Chroma
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_openai import OpenAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from supabase import create_client
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("rag-server")
 
-app = FastAPI(title="Urban Policy RAG Server")
+app = FastAPI(title="Seoul Urban Planner RAG Server")
 
 # --------------------------------------------------------------------------
 # 프롬프트
@@ -59,12 +71,18 @@ AUGMENT_SYSTEM = (
     "질문에 대한 답변은 하지 말고, 변환된 질문 한 문장만 출력하라."
 )
 
-# 답변 생성용 시스템 메시지
+# 다중 질문 검색기용 프롬프트: 한 질문을 서로 다른 관점의 질문 3개로 바꿔 검색 누락을 줄인다.
+MULTI_QUERY_PROMPT = PromptTemplate.from_template(
+    "당신은 벡터 DB 검색을 돕는 도우미입니다. 아래 질문을 서로 다른 관점의 한국어 질문 3개로 바꿔 쓰세요. "
+    "한 줄에 하나씩, 번호나 설명 없이 질문만 출력하세요.\n\n원래 질문: {question}"
+)
+
+# 답변 생성용 시스템 메시지 (시험에서 지정한 역할 정의 + 문서 기반 답변 규칙)
 ANSWER_SYSTEM = (
-    "너는 문서에 기반해 답변하는 도시 정책 전문가야.\n"
-    "아래 [문서] 에 있는 내용만 근거로 답변하고, 문서에 없는 내용은 추측하지 말고 "
-    "'제공된 문서에서 해당 내용을 찾을 수 없습니다'라고 답해라.\n"
-    "근거가 된 문서는 답변 끝에 [출처 번호] 형식으로 표기해라.\n\n[문서]\n{context}"
+    "당신은 도시 계획 설계자입니다. 특히 서울시에 특화된 설계자로 사용자의 질문에 답변하세요\n"
+    "아래 [문서] 에 있는 내용을 근거로 답변하고, 문서에 없는 내용은 추측하지 말고 "
+    "'제공된 문서에서 해당 내용을 찾을 수 없습니다'라고 답하세요.\n"
+    "근거가 된 문서는 답변 끝에 [출처 번호] 형식으로 표기하세요.\n\n[문서]\n{context}"
 )
 
 
@@ -103,7 +121,6 @@ def env(name: str, default: Optional[str] = None) -> str:
             "설정",
             f"환경 변수 '{name}' 가 설정되지 않았습니다.",
             f"Cloud Run 서비스의 환경 변수(또는 Secret)에 {name} 을 추가한 뒤 다시 배포하세요.",
-            status=500,
         )
     return value
 
@@ -125,25 +142,31 @@ async def stage_error_handler(_, exc: StageError):
 
 
 # --------------------------------------------------------------------------
-# 외부 서비스 클라이언트 (최초 사용 시 생성 -> 환경 변수가 없어도 /health 는 응답 가능)
+# 모델 / 벡터 DB (최초 사용 시 생성 -> 키가 없어도 /health 는 응답 가능)
 # --------------------------------------------------------------------------
 
-@lru_cache(maxsize=1)
-def get_supabase():
-    return create_client(env("SUPABASE_URL"), env("SUPABASE_SERVICE_KEY"))
+LLM_MODEL = lambda: os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")  # noqa: E731
+EMBED_MODEL = lambda: os.environ.get("EMBEDDING_MODEL", "models/gemini-embedding-001")  # noqa: E731
 
 
 @lru_cache(maxsize=1)
-def get_embeddings() -> OpenAIEmbeddings:
-    return OpenAIEmbeddings(
-        model=env("EMBEDDING_MODEL", "text-embedding-3-small"),
-        api_key=env("OPENAI_API_KEY"),
+def get_embeddings() -> GoogleGenerativeAIEmbeddings:
+    return GoogleGenerativeAIEmbeddings(model=EMBED_MODEL(), google_api_key=env("GOOGLE_API_KEY"))
+
+
+@lru_cache(maxsize=1)
+def get_vectorstore() -> Chroma:
+    """Chroma 컬렉션 (디스크에 저장)."""
+    return Chroma(
+        collection_name="seoul_urban_policy",
+        embedding_function=get_embeddings(),
+        persist_directory=env("CHROMA_DIR", "/tmp/chroma"),
     )
 
 
 def get_llm(streaming: bool) -> ChatGoogleGenerativeAI:
     return ChatGoogleGenerativeAI(
-        model=env("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+        model=LLM_MODEL(),
         google_api_key=env("GOOGLE_API_KEY"),
         temperature=0.2 if streaming else 0.0,
         streaming=streaming,
@@ -205,25 +228,30 @@ def sse_stream(worker) -> StreamingResponse:
 
 @app.get("/health")
 def health():
-    """연동 상태 확인: 환경 변수 설정 여부, Supabase 연결, 저장된 청크 수. (키 값은 노출하지 않음)"""
-    keys = ["GOOGLE_API_KEY", "OPENAI_API_KEY", "SUPABASE_URL", "SUPABASE_SERVICE_KEY"]
-    missing = [k for k in keys if not os.environ.get(k)]
+    """연동 상태 + RAG 설정 내용. (키 값은 노출하지 않음)"""
+    missing = [] if os.environ.get("GOOGLE_API_KEY") else ["GOOGLE_API_KEY"]
     result = {
         "ok": not missing,
         "missing_env": missing,
-        "llm_model": os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-        "embedding_model": os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small"),
-        "supabase": None,
+        # 클라이언트의 'RAG 설정 내용' 표시에 사용
+        "rag": {
+            "vector_db": "Chroma DB",
+            "embedding_model": EMBED_MODEL(),
+            "llm_model": LLM_MODEL(),
+            "retriever": "다중 질문 검색기 (MultiQueryRetriever)",
+            "query_expansion": "RunnablePassthrough 기반 질의 확장 (대화 기록으로 질문 명료화)",
+            "top_k": int(os.environ.get("TOP_K", "4")),
+        },
+        "chroma": None,
         "chunk_count": None,
     }
-    if not any(k.startswith("SUPABASE") for k in missing):
+    if not missing:
         try:
-            res = get_supabase().table("documents").select("id", count="exact").limit(1).execute()
-            result["supabase"] = "connected"
-            result["chunk_count"] = res.count
+            result["chunk_count"] = get_vectorstore()._collection.count()
+            result["chroma"] = "connected"
         except Exception as e:  # noqa: BLE001
             result["ok"] = False
-            result["supabase"] = f"{type(e).__name__}: {e} (supabase.sql 을 실행했는지 확인하세요)"
+            result["chroma"] = f"{type(e).__name__}: {e}"
     return result
 
 
@@ -257,7 +285,7 @@ class IngestRequest(BaseModel):
 
 @app.post("/ingest", dependencies=[Depends(check_api_key)])
 def ingest(req: IngestRequest):
-    """청크 분할 -> 임베딩 -> Supabase 저장. 진행 상황을 SSE 로 전달."""
+    """청크 분할 -> 임베딩 -> Chroma 저장. 진행 상황을 SSE 로 전달."""
 
     def worker(q):
         chunk_size = int(env("CHUNK_SIZE", "800"))
@@ -267,39 +295,34 @@ def ingest(req: IngestRequest):
         q.put({"type": "progress", "stage": "청크 분할", "percent": 5, "message": "텍스트를 청크로 분할하는 중"})
         with stage("청크 분할", "CHUNK_SIZE 가 CHUNK_OVERLAP 보다 큰지 확인하세요."):
             splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=overlap)
-            chunks = []
+            docs = []
             for p in req.pages:
                 for piece in splitter.split_text(p.text):
                     if piece.strip():
-                        chunks.append({"page": p.page, "content": piece})
-        if not chunks:
+                        docs.append(Document(page_content=piece,
+                                             metadata={"source": req.source, "page": p.page}))
+        if not docs:
             raise StageError("청크 분할", "분할 결과 청크가 0개입니다.", "PDF 텍스트가 비어 있는지 확인하세요.", 422)
         q.put({"type": "progress", "stage": "청크 분할", "percent": 10,
-               "message": f"{len(chunks)}개 청크 생성 (크기 {chunk_size}, 겹침 {overlap})"})
+               "message": f"{len(docs)}개 청크 생성 (크기 {chunk_size}, 겹침 {overlap})"})
 
         # 2) 같은 파일의 기존 청크 삭제 (재생성 시 중복 방지)
-        with stage("기존 데이터 삭제", "Supabase URL/서비스 키와 documents 테이블 존재 여부를 확인하세요."):
-            get_supabase().table("documents").delete().eq("source", req.source).execute()
+        with stage("기존 데이터 삭제", "CHROMA_DIR 경로에 쓰기 권한이 있는지 확인하세요."):
+            get_vectorstore()._collection.delete(where={"source": req.source})
 
-        # 3) 배치 단위 임베딩 + 저장
-        batch = 32
-        embeddings = get_embeddings()
-        for start in range(0, len(chunks), batch):
-            part = chunks[start:start + batch]
-            with stage("임베딩", "OPENAI_API_KEY 값과 OpenAI 사용 한도를 확인하세요."):
-                vectors = embeddings.embed_documents([c["content"] for c in part])
-            rows = [{"source": req.source, "page": c["page"], "chunk_index": start + i,
-                     "content": c["content"], "embedding": v}
-                    for i, (c, v) in enumerate(zip(part, vectors))]
-            with stage("Supabase 저장",
-                       "임베딩 차원(기본 1536)이 supabase.sql 의 vector(1536) 과 같은지 확인하세요."):
-                get_supabase().table("documents").insert(rows).execute()
+        # 3) 배치 단위 임베딩 + Chroma 저장
+        batch = 20
+        for start in range(0, len(docs), batch):
+            part = docs[start:start + batch]
+            with stage("임베딩/저장",
+                       "GOOGLE_API_KEY 값, 임베딩 모델명(EMBEDDING_MODEL), 구글 API 사용 한도를 확인하세요."):
+                get_vectorstore().add_documents(part)
             done = start + len(part)
             q.put({"type": "progress", "stage": "임베딩/저장",
-                   "percent": 10 + int(90 * done / len(chunks)),
-                   "message": f"{done}/{len(chunks)} 청크 저장 완료"})
+                   "percent": 10 + int(90 * done / len(docs)),
+                   "message": f"{done}/{len(docs)} 청크 저장 완료"})
 
-        q.put({"type": "done", "chunks": len(chunks), "source": req.source})
+        q.put({"type": "done", "chunks": len(docs), "source": req.source})
 
     return sse_stream(worker)
 
@@ -312,19 +335,18 @@ class ChatTurn(BaseModel):
 class QueryRequest(BaseModel):
     question: str
     history: List[ChatTurn] = []
-    source: Optional[str] = None   # 지정하면 해당 파일에서만 검색
 
 
 @app.post("/query", dependencies=[Depends(check_api_key)])
 def query(req: QueryRequest):
-    """질의 확장 -> 검색 -> 답변 스트리밍."""
+    """질의 확장 -> 다중 질문 검색 -> 답변 스트리밍."""
 
     def worker(q):
         question = req.question.strip()
         if not question:
             raise StageError("입력 검증", "질문이 비어 있습니다.", "질문을 입력하세요.", 400)
 
-        # 1) 질의 확장 체인: 프롬프트 | LLM | 문자열 파서
+        # 1) 질의 확장: RunnablePassthrough.assign 으로 원래 입력을 유지한 채 augmented_query 를 추가
         q.put({"type": "status", "stage": "질의 확장", "message": "대화 맥락으로 질문을 명확하게 변환하는 중"})
         chat_history = [HumanMessage(t.content) if t.role == "user" else AIMessage(t.content)
                         for t in req.history]
@@ -333,32 +355,39 @@ def query(req: QueryRequest):
             MessagesPlaceholder("chat_history"),   # 과거 대화 기록이 들어갈 동적 빈칸
             ("human", "{question}"),
         ])
-        query_augmentation_chain = augment_prompt | get_llm(streaming=False) | StrOutputParser()
+        llm_plain = get_llm(streaming=False)
+        expansion_chain = RunnablePassthrough.assign(
+            augmented_query=augment_prompt | llm_plain | StrOutputParser()
+        )
         with stage("질의 확장", "GOOGLE_API_KEY 와 GEMINI_MODEL 이름이 올바른지 확인하세요."):
-            augmented_query = query_augmentation_chain.invoke(
-                {"question": question, "chat_history": chat_history}).strip() or question
+            expanded = expansion_chain.invoke({"question": question, "chat_history": chat_history})
+        augmented_query = expanded["augmented_query"].strip() or question
         q.put({"type": "augmented", "query": augmented_query})
 
-        # 2) 증강된 질의로 벡터 검색 (Supabase RPC: match_documents)
-        q.put({"type": "status", "stage": "문서 검색", "message": "벡터 DB 에서 관련 청크를 검색하는 중"})
-        with stage("질의 임베딩", "OPENAI_API_KEY 값과 사용 한도를 확인하세요."):
-            vector = get_embeddings().embed_query(augmented_query)
-        with stage("벡터 검색", "supabase.sql 의 match_documents 함수가 생성되었는지 확인하세요."):
-            res = get_supabase().rpc("match_documents", {
-                "query_embedding": vector,
-                "match_count": int(env("TOP_K", "5")),
-                "filter_source": req.source,
-            }).execute()
-        docs = res.data or []
-        sources = [{"no": i + 1, "source": d["source"], "page": d["page"],
-                    "similarity": round(d["similarity"], 4), "content": d["content"]}
-                   for i, d in enumerate(docs)]
+        # 2) 다중 질문 검색: 증강된 질문을 여러 관점의 질문으로 바꿔 각각 검색한 뒤 중복 제거
+        q.put({"type": "status", "stage": "문서 검색", "message": "다중 질문 검색기로 Chroma 에서 검색하는 중"})
+        with stage("Chroma 연결", "먼저 PDF 로 '벡터 DB 생성'을 실행했는지 확인하세요."):
+            vs = get_vectorstore()
+            if vs._collection.count() == 0:
+                raise StageError("문서 검색", "Chroma 에 저장된 청크가 없습니다.",
+                                 "'벡터 DB 생성'을 먼저 실행하세요. (Cloud Run 이 재시작되면 데이터가 초기화됩니다)", 404)
+            base_retriever = vs.as_retriever(search_kwargs={"k": int(env("TOP_K", "4"))})
+            multi_retriever = MultiQueryRetriever.from_llm(
+                retriever=base_retriever, llm=llm_plain, prompt=MULTI_QUERY_PROMPT)
+        with stage("다중 질문 생성", "Gemini 사용 한도/모델명을 확인하세요."):
+            generated = multi_retriever.llm_chain.invoke({"question": augmented_query})
+            queries = [augmented_query] + [s.strip() for s in generated if s.strip()]
+        q.put({"type": "queries", "queries": queries})
+        with stage("벡터 검색", "임베딩 모델명과 GOOGLE_API_KEY 를 확인하세요."):
+            found = [d for qs in queries for d in base_retriever.invoke(qs)]
+            docs = multi_retriever.unique_union(found)
+        sources = [{"no": i + 1, "source": d.metadata.get("source"), "page": d.metadata.get("page"),
+                    "content": d.page_content} for i, d in enumerate(docs)]
         q.put({"type": "sources", "sources": sources})
         if not docs:
-            raise StageError("문서 검색", "검색된 문서가 없습니다.",
-                             "먼저 PDF 로 '벡터 DB 생성'을 실행했는지 확인하세요.", 404)
+            raise StageError("문서 검색", "검색된 문서가 없습니다.", "다른 표현으로 질문해 보세요.", 404)
 
-        # 3) 검색된 청크만 근거로 답변 생성 (StreamHandler 로 토큰 단위 스트리밍)
+        # 3) 검색된 청크를 근거로 답변 생성 (StreamHandler 로 토큰 단위 스트리밍)
         q.put({"type": "status", "stage": "답변 생성", "message": "Gemini 가 답변을 생성하는 중"})
         context = "\n\n".join(f"[{s['no']}] ({s['source']} p.{s['page']})\n{s['content']}" for s in sources)
         answer_prompt = ChatPromptTemplate.from_messages([
