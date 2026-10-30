@@ -44,7 +44,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from pypdf import PdfReader
 
-from langchain.retrievers.multi_query import MultiQueryRetriever
+# langchain 1.x 에서는 langchain-classic 으로 이동했으므로 두 경로를 모두 지원
+try:
+    from langchain_classic.retrievers.multi_query import MultiQueryRetriever
+except ImportError:
+    from langchain.retrievers.multi_query import MultiQueryRetriever
 from langchain_chroma import Chroma
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.documents import Document
