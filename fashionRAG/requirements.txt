@@ -1,1 +1,10 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+python-multipart==0.0.20
+chromadb==0.6.3
+pillow==11.1.0
+numpy==1.26.4
+google-genai==1.2.0
+
 
